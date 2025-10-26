@@ -52,11 +52,11 @@ type Client struct {
 }
 
 type Message struct {
-	Type      string    `json:"type"`
-	Content   string    `json:"content"`
-	Username  string    `json:"username"`
-	Timestamp time.Time `json:"timestamp"`
-	TimeStr   string    `json:"timeStr"` // HH:MM format timestamp
+	Type      string `json:"type"`
+	Content   string `json:"content"`
+	Username  string `json:"username"`
+	Timestamp string `json:"timestamp"` // Changed to string for proper serialization
+	TimeStr   string `json:"timeStr"`   // HH:MM format timestamp
 }
 
 type Hub struct {
@@ -97,7 +97,7 @@ type AuthResponse struct {
 func NewHub() *Hub {
 	return &Hub{
 		servers:    make(map[string]map[*Client]bool),
-		broadcast:  make(chan *MessageWithServer),
+		broadcast:  make(chan *MessageWithServer, 256), // Add buffer to prevent blocking
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		stop:       make(chan struct{}),
@@ -106,11 +106,23 @@ func NewHub() *Hub {
 
 // Run starts the hub's event loop
 func (h *Hub) Run() {
+	if logger != nil {
+		logger.Infof("Hub.Run() started")
+	}
+	if logger != nil {
+		logger.Infof("Hub.Run() entered select loop")
+	}
 	for {
 		select {
 		case <-h.stop:
+			if logger != nil {
+				logger.Infof("Hub.Run() received stop signal")
+			}
 			return
 		case client := <-h.register:
+			if logger != nil {
+				logger.Infof("Hub.Run() received register signal for client '%s'", client.username)
+			}
 			h.mutex.Lock()
 			if _, ok := h.servers[client.serverName]; !ok {
 				h.servers[client.serverName] = make(map[*Client]bool)
@@ -126,7 +138,7 @@ func (h *Hub) Run() {
 			joinMsg := &Message{
 				Type:      "join",
 				Username:  client.username,
-				Timestamp: now,
+				Timestamp: now.Format(time.RFC3339),
 				TimeStr:   now.Format("15:04"),
 				Content:   fmt.Sprintf("%s joined the chat", client.username),
 			}
@@ -153,13 +165,17 @@ func (h *Hub) Run() {
 			leaveMsg := &Message{
 				Type:      "leave",
 				Username:  client.username,
-				Timestamp: now,
+				Timestamp: now.Format(time.RFC3339),
 				TimeStr:   now.Format("15:04"),
 				Content:   fmt.Sprintf("%s left the chat", client.username),
 			}
 			h.broadcast <- &MessageWithServer{Message: leaveMsg, ServerName: client.serverName}
 
 		case msgWithServer := <-h.broadcast:
+			if logger != nil {
+				logger.Infof("===== Hub received broadcast for server '%s': %+v", msgWithServer.ServerName, msgWithServer.Message)
+			}
+
 			// Store message in database for search functionality
 			go func() {
 				if err := dbStoreMessage(
@@ -173,6 +189,10 @@ func (h *Hub) Run() {
 					if logger != nil {
 						logger.Errorf("Failed to store message in database: %v", err)
 					}
+				} else {
+					if logger != nil {
+						logger.Infof("Successfully stored message in database for server '%s'", msgWithServer.ServerName)
+					}
 				}
 			}()
 
@@ -182,15 +202,31 @@ func (h *Hub) Run() {
 
 			h.mutex.RLock()
 			clients := h.servers[msgWithServer.ServerName]
+			clientCount := len(clients)
+			if logger != nil {
+				logger.Infof("Server '%s' has %d clients", msgWithServer.ServerName, clientCount)
+			}
 			for client := range clients {
+				if logger != nil {
+					logger.Infof("Attempting to send message to client '%s' on server '%s'", client.username, client.serverName)
+				}
 				select {
 				case client.send <- msgWithServer.Message:
+					if logger != nil {
+						logger.Infof("✓ Sent message to client '%s'", client.username)
+					}
 				default:
+					if logger != nil {
+						logger.Warnf("✗ Failed to send message to client '%s', closing connection", client.username)
+					}
 					close(client.send)
 					delete(clients, client)
 				}
 			}
 			h.mutex.RUnlock()
+			if logger != nil {
+				logger.Infof("===== Finished broadcasting message to server '%s'", msgWithServer.ServerName)
+			}
 		}
 	}
 }
@@ -218,8 +254,16 @@ func (c *Client) readPump() {
 		var msg struct {
 			Content string `json:"content"`
 		}
+
+		if logger != nil {
+			logger.Infof("Client '%s' waiting for message on server '%s'", c.username, c.serverName)
+		}
+
 		err := c.conn.ReadJSON(&msg)
 		if err != nil {
+			if logger != nil {
+				logger.Infof("Client '%s' read error: %v", c.username, err)
+			}
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				if logger != nil {
 					logger.Errorf("websocket read error: %v", err)
@@ -228,16 +272,30 @@ func (c *Client) readPump() {
 			break
 		}
 
+		if logger != nil {
+			logger.Infof("Client '%s' received message content: '%s' on server '%s'", c.username, msg.Content, c.serverName)
+		}
+
 		now := time.Now()
 		fullMsg := &Message{
 			Type:      "chat",
 			Content:   msg.Content,
 			Username:  c.username,
-			Timestamp: now,
+			Timestamp: now.Format(time.RFC3339),
 			TimeStr:   now.Format("15:04"),
 		}
 
+		if logger != nil {
+			logger.Infof("Client '%s' broadcasting message to server '%s': %+v", c.username, c.serverName, fullMsg)
+		}
+
+		if logger != nil {
+			logger.Infof("Client '%s' sending message to hub.broadcast channel...", c.username)
+		}
 		c.hub.broadcast <- &MessageWithServer{Message: fullMsg, ServerName: c.serverName}
+		if logger != nil {
+			logger.Infof("Client '%s' successfully sent message to hub.broadcast channel", c.username)
+		}
 	}
 }
 
@@ -407,8 +465,13 @@ func dbCreateServer(name, hash string) error {
 }
 
 // dbStoreMessage stores a message in the database
-func dbStoreMessage(serverName, username, content, messageType, timeStr string, timestamp time.Time) error {
-	_, err := db.Exec("INSERT INTO messages (server_name, username, content, message_type, timestamp, time_str) VALUES (?, ?, ?, ?, ?, ?)",
+func dbStoreMessage(serverName, username, content, messageType, timeStr, timestampStr string) error {
+	// Parse the timestamp string to time.Time for database storage
+	timestamp, err := time.Parse(time.RFC3339, timestampStr)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("INSERT INTO messages (server_name, username, content, message_type, timestamp, time_str) VALUES (?, ?, ?, ?, ?, ?)",
 		serverName, username, content, messageType, timestamp, timeStr)
 	return err
 }
@@ -581,6 +644,70 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetChatHistory handles requests for chat history
+func handleGetChatHistory(w http.ResponseWriter, r *http.Request) {
+	username, ok := r.Context().Value(ctxUserKey).(string)
+	if !ok {
+		respondWithError(w, http.StatusInternalServerError, "Could not identify user")
+		return
+	}
+
+	serverName := r.URL.Query().Get("server")
+	if serverName == "" {
+		respondWithError(w, http.StatusBadRequest, "Server name is required")
+		return
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100 // default limit
+	if limitStr != "" {
+		if parsedLimit, err := fmt.Sscanf(limitStr, "%d", &limit); err != nil || parsedLimit != 1 {
+			respondWithError(w, http.StatusBadRequest, "Invalid limit parameter")
+			return
+		}
+		if limit > 500 {
+			limit = 500 // max limit
+		}
+		if limit < 1 {
+			limit = 1 // min limit
+		}
+	}
+
+	query := fmt.Sprintf("SELECT id, server_name, username, content, message_type, timestamp, time_str FROM messages WHERE server_name = ? ORDER BY timestamp ASC LIMIT ?")
+	rows, err := db.Query(query, serverName, limit)
+	if err != nil {
+		if logger != nil {
+			logger.Errorf("Failed to query chat history: %v", err)
+		}
+		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chat history")
+		return
+	}
+	defer rows.Close()
+
+	var results []SearchResult
+	for rows.Next() {
+		var result SearchResult
+		err := rows.Scan(&result.ID, &result.ServerName, &result.Username, &result.Content, &result.MessageType, &result.Timestamp, &result.TimeStr)
+		if err != nil {
+			if logger != nil {
+				logger.Errorf("Failed to scan chat history row: %v", err)
+			}
+			continue
+		}
+		results = append(results, result)
+	}
+
+	if logger != nil {
+		logger.Infof("User '%s' retrieved %d messages from server '%s'", username, len(results), serverName)
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"messages": results,
+		"count":    len(results),
+		"server":   serverName,
+	})
+}
+
 // handleCreateServer handles new server creation
 func handleCreateServer(w http.ResponseWriter, r *http.Request) {
 	username, ok := r.Context().Value(ctxUserKey).(string)
@@ -627,16 +754,26 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	serverName := vars["serverName"]
 	if serverName == "" {
+		if logger != nil {
+			logger.Warn("WebSocket connection attempt with empty server name")
+		}
 		respondWithError(w, http.StatusBadRequest, "Server name is required")
 		return
 	}
 
 	token := r.URL.Query().Get("token")
+	if logger != nil {
+		logger.Infof("WebSocket connection attempt to server '%s' with token '%s'", serverName, token)
+	}
+
 	tokenMutex.RLock()
 	username, ok := userTokens[token]
 	tokenMutex.RUnlock()
 
 	if !ok {
+		if logger != nil {
+			logger.Warnf("Invalid token attempt for server '%s'", serverName)
+		}
 		respondWithError(w, http.StatusUnauthorized, "Invalid or missing token")
 		return
 	}
@@ -644,13 +781,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	password := r.URL.Query().Get("password")
 	serverHash, err := dbGetServerHash(serverName)
 	if err != nil {
+		if logger != nil {
+			logger.Warnf("Server not found: '%s'", serverName)
+		}
 		respondWithError(w, http.StatusNotFound, "Server not found")
 		return
 	}
 
 	if err = bcrypt.CompareHashAndPassword([]byte(serverHash), []byte(password)); err != nil {
+		if logger != nil {
+			logger.Warnf("Invalid password for server '%s' by user '%s'", serverName, username)
+		}
 		respondWithError(w, http.StatusUnauthorized, "Invalid server password")
 		return
+	}
+
+	if logger != nil {
+		logger.Infof("Upgrading WebSocket connection for user '%s' to server '%s'", username, serverName)
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -659,6 +806,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			logger.Errorf("Failed to upgrade connection: %v", err)
 		}
 		return
+	}
+
+	if logger != nil {
+		logger.Infof("WebSocket connection established for user '%s' to server '%s'", username, serverName)
 	}
 
 	client := &Client{
@@ -769,6 +920,7 @@ func main() {
 	api.HandleFunc("/login", handleLogin).Methods("POST", "OPTIONS")
 	api.Handle("/servers/create", authMiddleware(http.HandlerFunc(handleCreateServer))).Methods("POST", "OPTIONS")
 	api.Handle("/search", authMiddleware(http.HandlerFunc(handleSearch))).Methods("GET", "OPTIONS")
+	api.Handle("/chat/history", authMiddleware(http.HandlerFunc(handleGetChatHistory))).Methods("GET", "OPTIONS")
 
 	r.HandleFunc("/ws/{serverName}", handleWebSocket)
 
@@ -776,7 +928,7 @@ func main() {
 
 	port := "5000"
 	srv := &http.Server{
-		Addr:         ":" + port,
+		Addr:         "0.0.0.0:" + port,
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -785,6 +937,8 @@ func main() {
 
 	go func() {
 		logger.Infof("Server starting on port %s", port)
+		logger.Infof("Server accessible at: http://localhost:%s", port)
+		logger.Infof("For other devices on your network, use your local IP with port %s (e.g., http://10.1.33.159:%s)", port, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("listen: %v", err)
 		}

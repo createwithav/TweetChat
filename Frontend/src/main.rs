@@ -1,9 +1,11 @@
 use leptos::*;
 use leptos_meta::*;
+use leptos::spawn_local;
 use serde::{Deserialize, Serialize};
-use web_sys::{Request, RequestInit, RequestMode, Response};
+use web_sys::{Request, RequestInit, RequestMode, Response, WebSocket, MessageEvent, CloseEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
+use js_sys;
 
 // --- Structs ---
 
@@ -265,10 +267,269 @@ fn ChatPage(auth: AuthState, set_auth: WriteSignal<Option<AuthState>>) -> impl I
     
     // General error/success messages
     let form_message = create_rw_signal(None::<String>);
+    
+    // Current server state
+    let current_server = create_rw_signal(None::<String>);
+    
+    // WebSocket connection state
+    let ws_connection = create_rw_signal(None::<WebSocket>);
 
     // Handler for logging out
     let on_logout = move |_| {
+        // Close WebSocket if connected
+        if let Some(ws) = ws_connection.get() {
+            ws.close().ok();
+        }
         set_auth.set(None); // Clear auth state
+    };
+    
+    // Function to connect to WebSocket
+    let connect_to_server = {
+        let token = auth.token.clone();
+        let auth_clone = auth.clone();
+        let messages = messages.clone();
+        let form_message = form_message.clone();
+        let current_server = current_server.clone();
+        let ws_connection = ws_connection.clone();
+        let set_join_server_name = set_join_server_name.clone();
+        let set_join_server_pass = set_join_server_pass.clone();
+        
+        move |server_name: String, password: String| {
+            // Close existing connection
+            if let Some(ws) = ws_connection.get() {
+                ws.close().ok();
+            }
+            
+            let url = format!("ws://localhost:5000/ws/{}?token={}&password={}", 
+                server_name, token, password);
+            
+            log::info!("Connecting to: {}", url);
+            
+            match WebSocket::new(&url) {
+                Ok(ws) => {
+                    let messages_clone = messages.clone();
+                    let auth_username = auth_clone.username.clone();
+                    
+                    // Setup message handler
+                    let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {
+                        // Get the message data as a string
+                        let text = e.data().as_string();
+                        
+                        if let Some(text) = text {
+                            log::info!("Received message: {}", text);
+                            
+                            match serde_json::from_str::<ChatMessage>(&text) {
+                                Ok(msg) => {
+                                    log::info!("Successfully parsed message from {}: {}", msg.username, msg.content);
+                                    messages_clone.update(|msgs| {
+                                        msgs.push(msg);
+                                    });
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to parse message '{}': {:?}", text, err);
+                                }
+                            }
+                        } else {
+                            log::error!("Could not extract message text from WebSocket event");
+                        }
+                    }) as Box<dyn FnMut(MessageEvent)>);
+                    
+                    ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
+                    onmessage_callback.forget();
+                    
+                    // Setup close handler
+                    let onclose_callback = Closure::wrap(Box::new(move |e: CloseEvent| {
+                        log::info!("WebSocket closed: {:?}", e.reason());
+                        form_message.set(Some("Disconnected from server".to_string()));
+                    }) as Box<dyn FnMut(CloseEvent)>);
+                    
+                    ws.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
+                    onclose_callback.forget();
+                    
+                    // Setup error handler
+                    let onerror_callback = Closure::wrap(Box::new(move |_| {
+                        log::error!("WebSocket error");
+                        form_message.set(Some("Error connecting to server".to_string()));
+                    }) as Box<dyn FnMut(JsValue)>);
+                    
+                    ws.set_onerror(Some(onerror_callback.as_ref().unchecked_ref()));
+                    onerror_callback.forget();
+                    
+                    // Setup open handler
+                    let messages_clone = messages.clone();
+                    let auth_username_clone = auth_username.clone();
+                    let server_name_clone = server_name.clone();
+                    let form_message_clone = form_message.clone();
+                    let token_clone = token.clone();
+                    let onopen_callback = Closure::wrap(Box::new(move |_| {
+                        log::info!("WebSocket connected");
+                        form_message_clone.set(Some(format!("Connected to server '{}'", server_name_clone)));
+                        
+                        // Fetch chat history
+                        let messages_for_history = messages_clone.clone();
+                        let server_name_for_history = server_name_clone.clone();
+                        let token_for_history = token_clone.clone();
+                        
+                        spawn_local(async move {
+                            let url = format!("{}/api/chat/history?server={}&limit=100", BACKEND_URL, server_name_for_history);
+                            log::info!("Loading chat history from: {}", url);
+                            
+                            let opts = RequestInit::new();
+                            opts.set_method("GET");
+                            opts.set_mode(RequestMode::Cors);
+                            
+                            let headers = web_sys::Headers::new().unwrap();
+                            headers.set("Authorization", &format!("Bearer {}", token_for_history)).unwrap();
+                            opts.set_headers(&headers);
+                            
+                            let request = Request::new_with_str_and_init(&url, &opts).unwrap();
+                            let window = web_sys::window().unwrap();
+                            
+                            match JsFuture::from(window.fetch_with_request(&request)).await {
+                                Ok(resp_value) => {
+                                    let resp: Response = resp_value.dyn_into().unwrap();
+                                    
+                                    if resp.ok() {
+                                        match JsFuture::from(resp.json().unwrap()).await {
+                                            Ok(json) => {
+                                                // Parse the response
+                                                match js_sys::Reflect::get(&json, &JsValue::from_str("messages")) {
+                                                    Ok(msgs_value) => {
+                                                        if let Some(messages_array) = msgs_value.dyn_ref::<js_sys::Array>() {
+                                                            let mut loaded_messages = Vec::new();
+                                                            for i in 0..messages_array.length() {
+                                                                if let Some(msg_obj) = messages_array.get(i).dyn_ref::<js_sys::Object>() {
+                                                                    let id = js_sys::Reflect::get(msg_obj, &JsValue::from_str("id")).ok()
+                                                                        .and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                                    let username = js_sys::Reflect::get(msg_obj, &JsValue::from_str("username")).ok()
+                                                                        .and_then(|v| v.as_string()).unwrap_or_default();
+                                                                    let content = js_sys::Reflect::get(msg_obj, &JsValue::from_str("content")).ok()
+                                                                        .and_then(|v| v.as_string()).unwrap_or_default();
+                                                                    let msg_type = js_sys::Reflect::get(msg_obj, &JsValue::from_str("messageType")).ok()
+                                                                        .and_then(|v| v.as_string()).unwrap_or_default();
+                                                                    let time_str = js_sys::Reflect::get(msg_obj, &JsValue::from_str("timeStr")).ok()
+                                                                        .and_then(|v| v.as_string()).unwrap_or_default();
+                                                                    
+                                                                    let timestamp = js_sys::Reflect::get(msg_obj, &JsValue::from_str("timestamp")).ok()
+                                                                        .and_then(|v| {
+                                                                            if v.is_string() {
+                                                                                v.as_string()
+                                                                            } else {
+                                                                                Some(format!("{:?}", v))
+                                                                            }
+                                                                        }).unwrap_or_default();
+                                                                    
+                                                                    let chat_msg = ChatMessage {
+                                                                        msg_type: if msg_type.is_empty() { "chat".to_string() } else { msg_type },
+                                                                        username,
+                                                                        content,
+                                                                        timestamp,
+                                                                        time_str: if time_str.is_empty() { "-".to_string() } else { time_str },
+                                                                    };
+                                                                    
+                                                                    loaded_messages.push(chat_msg);
+                                                                }
+                                                            }
+                                                            
+                                                            messages_for_history.update(|msgs| {
+                                                                *msgs = loaded_messages;
+                                                            });
+                                                            
+                                                            log::info!("Loaded {} messages from history", messages_array.length());
+                                                        }
+                                                    }
+                                                    Err(_) => log::warn!("Failed to get messages from history response"),
+                                                }
+                                            }
+                                            Err(err) => {
+                                                log::error!("Failed to parse history JSON: {:?}", err);
+                                            }
+                                        }
+                                    } else {
+                                        log::error!("Failed to load chat history: {:?}", resp.status());
+                                    }
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to fetch chat history: {:?}", err);
+                                }
+                            }
+                        });
+                    }) as Box<dyn FnMut(JsValue)>);
+                    
+                    ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
+                    onopen_callback.forget();
+                    
+                    ws_connection.set(Some(ws));
+                    current_server.set(Some(server_name));
+                    set_join_server_name.set(String::new());
+                    set_join_server_pass.set(String::new());
+                }
+                Err(err) => {
+                    log::error!("Failed to create WebSocket: {:?}", err);
+                    form_message.set(Some("Failed to connect to server".to_string()));
+                }
+            }
+        }
+    };
+    
+    // Handler for joining a server
+    let on_join_server = {
+        let join_server_name = join_server_name.clone();
+        let join_server_pass = join_server_pass.clone();
+        let connect_fn = connect_to_server.clone();
+        
+        move |ev: ev::SubmitEvent| {
+            ev.prevent_default();
+            let server_name = join_server_name.get();
+            let password = join_server_pass.get();
+            
+            if server_name.is_empty() || password.is_empty() {
+                form_message.set(Some("Please enter server name and password".to_string()));
+                return;
+            }
+            
+            // Clear messages when joining new server
+            messages.set(Vec::new());
+            
+            connect_fn(server_name, password);
+        }
+    };
+    
+    // Handler for sending messages
+    let on_send_message = {
+        let message_to_send = message_to_send.clone();
+        let set_message_to_send = set_message_to_send.clone();
+        let ws_connection = ws_connection.clone();
+        let current_server = current_server.clone();
+        let form_message = form_message.clone();
+        
+        move |ev: ev::SubmitEvent| {
+            ev.prevent_default();
+            let msg = message_to_send.get();
+            
+            if msg.is_empty() {
+                return;
+            }
+            
+            if current_server.get().is_none() {
+                form_message.set(Some("Please join a server first".to_string()));
+                return;
+            }
+            
+            if let Some(ws) = ws_connection.get() {
+                let client_msg = ClientMessage { content: msg };
+                if let Ok(json) = serde_json::to_string(&client_msg) {
+                    if let Err(err) = ws.send_with_str(&json) {
+                        log::error!("Failed to send message: {:?}", err);
+                        form_message.set(Some("Failed to send message".to_string()));
+                    } else {
+                        set_message_to_send.set(String::new());
+                    }
+                }
+            } else {
+                form_message.set(Some("Not connected to a server".to_string()));
+            }
+        }
     };
 
     // --- Render ---
@@ -312,7 +573,7 @@ fn ChatPage(auth: AuthState, set_auth: WriteSignal<Option<AuthState>>) -> impl I
                 </form>
 
                 // Join Server Form
-                <form>
+                <form on:submit=on_join_server>
                     <h3 class="text-lg font-semibold text-gray-700 mb-4">Join Server</h3>
                     <input class="shadow-sm border rounded-lg w-full py-2 px-3 text-gray-700 mb-3"
                         type="text" placeholder="Server Name"
@@ -326,6 +587,14 @@ fn ChatPage(auth: AuthState, set_auth: WriteSignal<Option<AuthState>>) -> impl I
                         Join
                     </button>
                 </form>
+                
+                // Show current server info
+                <Show when=move || current_server.get().is_some() fallback=|| ()>
+                    <div class="mt-4 p-3 bg-gray-50 rounded-lg">
+                        <p class="text-sm text-gray-600">Current Server:</p>
+                        <p class="font-semibold text-gray-800">{current_server.get().unwrap()}</p>
+                    </div>
+                </Show>
             </div>
 
             // --- Main Chat Area ---
@@ -375,7 +644,7 @@ fn ChatPage(auth: AuthState, set_auth: WriteSignal<Option<AuthState>>) -> impl I
                 </div>
 
                 // Message Input Form
-                <form class="p-6 bg-white shadow-md">
+                <form class="p-6 bg-white shadow-md" on:submit=on_send_message>
                     <div class="flex space-x-4">
                         <input class="flex-1 shadow-sm border rounded-lg w-full py-3 px-4 text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
                             type="text"
