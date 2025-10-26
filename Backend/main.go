@@ -56,6 +56,7 @@ type Message struct {
 	Content   string    `json:"content"`
 	Username  string    `json:"username"`
 	Timestamp time.Time `json:"timestamp"`
+	TimeStr   string    `json:"timeStr"` // HH:MM format timestamp
 }
 
 type Hub struct {
@@ -121,10 +122,12 @@ func (h *Hub) Run() {
 				logger.Infof("Client %s registered to server %s", client.username, client.serverName)
 			}
 
+			now := time.Now()
 			joinMsg := &Message{
 				Type:      "join",
 				Username:  client.username,
-				Timestamp: time.Now(),
+				Timestamp: now,
+				TimeStr:   now.Format("15:04"),
 				Content:   fmt.Sprintf("%s joined the chat", client.username),
 			}
 			h.broadcast <- &MessageWithServer{Message: joinMsg, ServerName: client.serverName}
@@ -146,15 +149,33 @@ func (h *Hub) Run() {
 				logger.Infof("Client %s unregistered from server %s", client.username, client.serverName)
 			}
 
+			now := time.Now()
 			leaveMsg := &Message{
 				Type:      "leave",
 				Username:  client.username,
-				Timestamp: time.Now(),
+				Timestamp: now,
+				TimeStr:   now.Format("15:04"),
 				Content:   fmt.Sprintf("%s left the chat", client.username),
 			}
 			h.broadcast <- &MessageWithServer{Message: leaveMsg, ServerName: client.serverName}
 
 		case msgWithServer := <-h.broadcast:
+			// Store message in database for search functionality
+			go func() {
+				if err := dbStoreMessage(
+					msgWithServer.ServerName,
+					msgWithServer.Message.Username,
+					msgWithServer.Message.Content,
+					msgWithServer.Message.Type,
+					msgWithServer.Message.TimeStr,
+					msgWithServer.Message.Timestamp,
+				); err != nil {
+					if logger != nil {
+						logger.Errorf("Failed to store message in database: %v", err)
+					}
+				}
+			}()
+
 			if msgWithServer.Message.Type == "chat" {
 				go logMessage(msgWithServer.ServerName, msgWithServer.Message.Username, msgWithServer.Message.Content)
 			}
@@ -207,11 +228,13 @@ func (c *Client) readPump() {
 			break
 		}
 
+		now := time.Now()
 		fullMsg := &Message{
 			Type:      "chat",
 			Content:   msg.Content,
 			Username:  c.username,
-			Timestamp: time.Now(),
+			Timestamp: now,
+			TimeStr:   now.Format("15:04"),
 		}
 
 		c.hub.broadcast <- &MessageWithServer{Message: fullMsg, ServerName: c.serverName}
@@ -327,6 +350,31 @@ func initDB() {
 		}
 	}
 
+	messagesTable := `
+	CREATE TABLE IF NOT EXISTS messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		server_name TEXT NOT NULL,
+		username TEXT NOT NULL,
+		content TEXT NOT NULL,
+		message_type TEXT NOT NULL,
+		timestamp DATETIME NOT NULL,
+		time_str TEXT NOT NULL
+	);
+	`
+	if _, err = db.Exec(messagesTable); err != nil {
+		if logger != nil {
+			logger.Fatalw("failed to create messages table", "error", err)
+		}
+	}
+
+	// Create index for better search performance
+	indexSQL := `CREATE INDEX IF NOT EXISTS idx_messages_search ON messages(server_name, username, content, timestamp);`
+	if _, err = db.Exec(indexSQL); err != nil {
+		if logger != nil {
+			logger.Fatalw("failed to create search index", "error", err)
+		}
+	}
+
 	if logger != nil {
 		logger.Infow("Database initialized successfully")
 	}
@@ -356,6 +404,63 @@ func dbGetServerHash(name string) (string, error) {
 func dbCreateServer(name, hash string) error {
 	_, err := db.Exec("INSERT INTO servers (name, password_hash) VALUES (?, ?)", name, hash)
 	return err
+}
+
+// dbStoreMessage stores a message in the database
+func dbStoreMessage(serverName, username, content, messageType, timeStr string, timestamp time.Time) error {
+	_, err := db.Exec("INSERT INTO messages (server_name, username, content, message_type, timestamp, time_str) VALUES (?, ?, ?, ?, ?, ?)",
+		serverName, username, content, messageType, timestamp, timeStr)
+	return err
+}
+
+// SearchResult represents a search result
+type SearchResult struct {
+	ID          int       `json:"id"`
+	ServerName  string    `json:"serverName"`
+	Username    string    `json:"username"`
+	Content     string    `json:"content"`
+	MessageType string    `json:"messageType"`
+	Timestamp   time.Time `json:"timestamp"`
+	TimeStr     string    `json:"timeStr"`
+}
+
+// dbSearchMessages searches messages by username, content, or server name
+func dbSearchMessages(query, searchType string, limit int) ([]SearchResult, error) {
+	var rows *sql.Rows
+	var err error
+
+	baseQuery := "SELECT id, server_name, username, content, message_type, timestamp, time_str FROM messages WHERE "
+
+	switch searchType {
+	case "username":
+		rows, err = db.Query(baseQuery+"username LIKE ? ORDER BY timestamp DESC LIMIT ?", "%"+query+"%", limit)
+	case "content":
+		rows, err = db.Query(baseQuery+"content LIKE ? ORDER BY timestamp DESC LIMIT ?", "%"+query+"%", limit)
+	case "server":
+		rows, err = db.Query(baseQuery+"server_name LIKE ? ORDER BY timestamp DESC LIMIT ?", "%"+query+"%", limit)
+	case "all":
+		rows, err = db.Query(baseQuery+"(username LIKE ? OR content LIKE ? OR server_name LIKE ?) ORDER BY timestamp DESC LIMIT ?",
+			"%"+query+"%", "%"+query+"%", "%"+query+"%", limit)
+	default:
+		return nil, fmt.Errorf("invalid search type")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []SearchResult
+	for rows.Next() {
+		var result SearchResult
+		err := rows.Scan(&result.ID, &result.ServerName, &result.Username, &result.Content, &result.MessageType, &result.Timestamp, &result.TimeStr)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+	}
+
+	return results, nil
 }
 
 // --- HTTP Handlers ---
@@ -428,6 +533,52 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		logger.Infof("User logged in: %s", creds.Username)
 	}
 	respondWithJSON(w, http.StatusOK, AuthResponse{Token: token, Username: creds.Username})
+}
+
+// handleSearch handles message search requests
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	searchType := r.URL.Query().Get("type")
+	limitStr := r.URL.Query().Get("limit")
+
+	if query == "" {
+		respondWithError(w, http.StatusBadRequest, "Query parameter 'q' is required")
+		return
+	}
+
+	if searchType == "" {
+		searchType = "all"
+	}
+
+	limit := 50 // default limit
+	if limitStr != "" {
+		if parsedLimit, err := fmt.Sscanf(limitStr, "%d", &limit); err != nil || parsedLimit != 1 {
+			respondWithError(w, http.StatusBadRequest, "Invalid limit parameter")
+			return
+		}
+		if limit > 100 {
+			limit = 100 // max limit
+		}
+		if limit < 1 {
+			limit = 1 // min limit
+		}
+	}
+
+	results, err := dbSearchMessages(query, searchType, limit)
+	if err != nil {
+		if logger != nil {
+			logger.Errorf("Search error: %v", err)
+		}
+		respondWithError(w, http.StatusInternalServerError, "Search failed")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"results": results,
+		"count":   len(results),
+		"query":   query,
+		"type":    searchType,
+	})
 }
 
 // handleCreateServer handles new server creation
@@ -617,6 +768,7 @@ func main() {
 	api.HandleFunc("/register", handleRegister).Methods("POST", "OPTIONS")
 	api.HandleFunc("/login", handleLogin).Methods("POST", "OPTIONS")
 	api.Handle("/servers/create", authMiddleware(http.HandlerFunc(handleCreateServer))).Methods("POST", "OPTIONS")
+	api.Handle("/search", authMiddleware(http.HandlerFunc(handleSearch))).Methods("GET", "OPTIONS")
 
 	r.HandleFunc("/ws/{serverName}", handleWebSocket)
 

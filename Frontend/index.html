@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TweetChat - Go + Leptos</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom scrollbar for chat */
+        #chat-window::-webkit-scrollbar {
+            width: 8px;
+        }
+        #chat-window::-webkit-scrollbar-thumb {
+            background-color: #cbd5e1; /* cool-gray-300 */
+            border-radius: 4px;
+        }
+        #chat-window::-webkit-scrollbar-track {
+            background-color: #f1f5f9; /* cool-gray-100 */
+        }
+        
+        /* Search results styling */
+        .search-result {
+            transition: all 0.2s ease;
+        }
+        .search-result:hover {
+            background-color: #f8fafc;
+            transform: translateY(-1px);
+        }
+        
+        /* Message animations */
+        .message-enter {
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <!-- Leptos will mount the app here -->
+    <script type="module">
+        console.log('Loading Leptos chat...');
+        try {
+            const { default: init } = await import('./pkg/leptos_chat.js');
+            console.log('Module loaded successfully');
+            await init();
+            console.log('Leptos app initialized');
+        } catch (error) {
+            console.error('Failed to load Leptos module:', error);
+            // Redirect to simple HTML version
+            window.location.href = 'simple-chat.html';
+        }
+    </script>
+</body>
+</html>
